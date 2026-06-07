@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Detector V0 — distraction detector for Linux desktops.
 
-Periodically captures a screenshot (via /dev/fb0 framebuffer) and audio
+Periodically captures a screenshot (via gnome-screenshot) and audio
 (via pw-record), sends both to Gemini 3.1 Flash-Lite for analysis, and
 shows a system tray cross icon: green = productive, red = distracting.
 
@@ -9,10 +9,10 @@ Usage:
     python detector.py
 
 System dependencies:
+    gnome-screenshot                   apt install gnome-screenshot
     pw-record                          PipeWire audio recorder
     python3-gi                         PyGObject
     gir1.2-ayatanaappindicator3-0.1    Tray indicator
-    User must be in the 'video' group   (sudo usermod -aG video $USER)
 
 Python dependencies:
     pip install 'pydantic-ai[google]' Pillow
@@ -26,10 +26,8 @@ from __future__ import annotations
 import asyncio
 import io
 import logging
-import mmap
 import os
 import signal
-import struct
 import tempfile
 import threading
 from dataclasses import dataclass, field
@@ -79,68 +77,26 @@ Ambiguous content should NOT be flagged.
 """
 
 # ---------------------------------------------------------------------------
-# Screen capture (direct /dev/fb0 framebuffer read — no portal, no flash)
+# Screen capture (Pillow ImageGrab -> gnome-screenshot)
 # ---------------------------------------------------------------------------
 
-FB_DEVICE = "/dev/fb0"
 
+def _take_screenshot_sync() -> bytes:
+    """Take a screenshot via Pillow's ImageGrab.
 
-def _read_fb_info() -> tuple[int, int, int]:
-    """Read framebuffer dimensions from sysfs. Returns (width, height, bpp)."""
-    base = Path("/sys/class/graphics/fb0")
-    vsize = (base / "virtual_size").read_text().strip()
-    w, h = (int(x) for x in vsize.split(","))
-    bpp = int((base / "bits_per_pixel").read_text().strip())
-    return w, h, bpp
-
-
-def _fb_to_png(width: int, height: int, raw: bytes) -> bytes:
-    """Convert raw BGRA/BGRX framebuffer data to PNG bytes.
-
-    Uses the pure-Python approach: write a minimal PNG via zlib.
-    The framebuffer is BGRX (32bpp) — we swap to RGB for the PNG.
+    On GNOME Wayland this delegates to gnome-screenshot under the hood.
+    Returns PNG bytes.
     """
-    from PIL import Image
+    from PIL import ImageGrab
 
-    # Framebuffer is BGRX 32bpp — 4 bytes per pixel, but blue/red swapped
-    img = Image.frombytes("RGBA", (width, height), raw, "raw", "BGRA")
-    img = img.convert("RGB")
-
+    img = ImageGrab.grab()
     buf = io.BytesIO()
     img.save(buf, format="PNG", optimize=False)
     return buf.getvalue()
 
 
-def _take_screenshot_sync() -> bytes:
-    """Read the screen directly from /dev/fb0. No D-Bus, no portal, no flash.
-
-    Requires the user to be in the 'video' group (or root).
-    Returns PNG bytes.
-    """
-    w, h, bpp = _read_fb_info()
-    stride = w * (bpp // 8)
-    size = stride * h
-
-    fd = os.open(FB_DEVICE, os.O_RDONLY)
-    try:
-        buf = mmap.mmap(fd, size, mmap.MAP_SHARED, mmap.PROT_READ)
-        try:
-            raw = buf[:size]
-        finally:
-            buf.close()
-    finally:
-        os.close(fd)
-
-    return _fb_to_png(w, h, raw)
-
-
 async def capture_screenshot() -> bytes:
-    """Capture the screen by reading /dev/fb0 directly.
-
-    Completely silent — reads the GPU scanout buffer via the Linux
-    framebuffer device. No compositor interaction, no flash, no animation.
-    Requires membership in the 'video' group.
-    """
+    """Capture a full-screen PNG screenshot. Returns PNG bytes."""
     loop = asyncio.get_running_loop()
     data = await loop.run_in_executor(None, _take_screenshot_sync)
     log.info("Captured screenshot: %d bytes", len(data))
