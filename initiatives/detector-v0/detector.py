@@ -1,15 +1,14 @@
 #!/usr/bin/env python3
 """Detector V0 — distraction detector for Linux desktops.
 
-Periodically captures a screenshot (via grim) and audio (via pw-record),
-sends both to Gemini 3.1 Flash-Lite for analysis, and shows a system tray
-cross icon: green = productive, red = distracting.
+Periodically captures a screenshot (via XDG Desktop Portal) and audio
+(via pw-record), sends both to Gemini 3.1 Flash-Lite for analysis, and
+shows a system tray cross icon: green = productive, red = distracting.
 
 Usage:
     python detector.py
 
 System dependencies:
-    grim                               Wayland screenshot tool
     pw-record                          PipeWire audio recorder
     python3-gi                         PyGObject
     gir1.2-ayatanaappindicator3-0.1    Tray indicator
@@ -31,13 +30,24 @@ import tempfile
 import threading
 from dataclasses import dataclass, field
 from pathlib import Path
+from urllib.parse import unquote, urlparse
 
 import gi
 
 gi.require_version("Gtk", "3.0")
 gi.require_version("AyatanaAppIndicator3", "0.1")
 
-from gi.repository import AyatanaAppIndicator3, GLib, Gtk  # noqa: E402
+from gi.repository import AyatanaAppIndicator3, Gio, GLib, Gtk  # noqa: E402
+
+_session_bus: Gio.DBusConnection | None = None
+
+
+def _get_session_bus() -> Gio.DBusConnection:
+    """Lazy singleton for the session D-Bus connection."""
+    global _session_bus
+    if _session_bus is None:
+        _session_bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
+    return _session_bus
 from pydantic_ai import Agent, BinaryContent, RunContext  # noqa: E402
 
 log = logging.getLogger(__name__)
@@ -76,27 +86,101 @@ Ambiguous content should NOT be flagged.
 """
 
 # ---------------------------------------------------------------------------
-# Screen capture
+# Screen capture (GNOME Wayland — silent, no flash)
 # ---------------------------------------------------------------------------
 
 
-async def capture_screenshot() -> bytes:
-    """Capture a full-screen PNG screenshot via grim.
+def _screenshot_gnome_shell(tmp_path: str) -> bool:
+    """Try org.gnome.Shell.Screenshot (no flash, no UI). Returns True on success."""
+    try:
+        result = _get_session_bus().call_sync(
+            "org.gnome.Shell.Screenshot",
+            "/org/gnome/Shell/Screenshot",
+            "org.gnome.Shell.Screenshot",
+            "Screenshot",
+            GLib.Variant("(bbs)", (False, False, tmp_path)),
+            GLib.VariantType("(bs)"),
+            Gio.DBusCallFlags.NONE,
+            10000,
+            None,
+        )
+        success, _path = result.unpack()
+        return success
+    except Exception as e:
+        log.debug("GNOME Shell screenshot unavailable: %s", e)
+        return False
 
-    Returns PNG bytes. Raises RuntimeError on failure.
+
+def _screenshot_portal(tmp_path: str) -> bool:
+    """Fallback: XDG Desktop Portal Screenshot (interactive=false)."""
+    bus = _get_session_bus()
+    result_event = threading.Event()
+    captured: dict[str, str | None] = {"uri": None}
+
+    reply = bus.call_sync(
+        "org.freedesktop.portal.Desktop",
+        "/org/freedesktop/portal/desktop",
+        "org.freedesktop.portal.Screenshot",
+        "Screenshot",
+        GLib.Variant("(sa{sv})", ("", {"interactive": GLib.Variant("b", False)})),
+        GLib.VariantType("(o)"),
+        Gio.DBusCallFlags.NONE,
+        10000,
+        None,
+    )
+    request_path = reply.unpack()[0]
+
+    def on_response(_conn, _sender, _path, _iface, _signal, params):
+        response, results = params.unpack()
+        if response == 0:
+            captured["uri"] = results["uri"]
+        result_event.set()
+
+    sub_id = bus.signal_subscribe(
+        "org.freedesktop.portal.Desktop",
+        "org.freedesktop.portal.Request",
+        "Response",
+        request_path,
+        None,
+        Gio.DBusSignalFlags.NO_MATCH_RULE,
+        on_response,
+    )
+
+    result_event.wait(timeout=10.0)
+    bus.signal_unsubscribe(sub_id)
+
+    if captured["uri"] is None:
+        return False
+
+    # Portal saves its own file; copy to our tmp_path
+    src = unquote(urlparse(captured["uri"]).path)
+    try:
+        with open(src, "rb") as fsrc, open(tmp_path, "wb") as fdst:
+            fdst.write(fsrc.read())
+    finally:
+        try:
+            os.unlink(src)
+        except OSError:
+            pass
+    return True
+
+
+async def capture_screenshot() -> bytes:
+    """Capture a full-screen PNG screenshot (silent, no flash).
+
+    Tries GNOME Shell D-Bus first, falls back to XDG portal.
+    Returns PNG bytes.
     """
     fd, tmp_path = tempfile.mkstemp(suffix=".png")
     os.close(fd)
     try:
-        proc = await asyncio.create_subprocess_exec(
-            "grim", tmp_path,
-            stdout=asyncio.subprocess.DEVNULL,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        _, stderr = await proc.communicate()
-        if proc.returncode != 0:
-            err_msg = stderr.decode().strip() if stderr else "unknown error"
-            raise RuntimeError(f"grim failed (exit {proc.returncode}): {err_msg}")
+        loop = asyncio.get_running_loop()
+        ok = await loop.run_in_executor(None, _screenshot_gnome_shell, tmp_path)
+        if not ok:
+            log.info("GNOME Shell screenshot denied, trying portal fallback")
+            ok = await loop.run_in_executor(None, _screenshot_portal, tmp_path)
+        if not ok:
+            raise RuntimeError("All screenshot methods failed")
         with open(tmp_path, "rb") as f:
             data = f.read()
         if len(data) < 100:
