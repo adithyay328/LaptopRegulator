@@ -1,0 +1,10 @@
+[project]
+name = "detector-v0"
+version = "0.1.0"
+requires-python = ">=3.12"
+dependencies = [
+    "pydantic-ai[google]",
+]
+
+[project.scripts]
+detector-v0 = "detector_v0.main:main"
