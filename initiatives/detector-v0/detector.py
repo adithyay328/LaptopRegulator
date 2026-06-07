@@ -114,20 +114,21 @@ def _screenshot_gnome_shell(tmp_path: str) -> bool:
 _portal_token_counter = 0
 
 
-def _screenshot_portal(tmp_path: str) -> bool:
-    """Fallback: XDG Desktop Portal Screenshot (interactive=false).
+def _screenshot_portal_on_main_thread(tmp_path: str, result_event: threading.Event,
+                                       captured: dict) -> bool:
+    """Schedule the portal screenshot entirely on the GLib main thread.
 
-    Subscribes to the Response signal BEFORE making the call so we never
-    miss a fast reply.
+    D-Bus signal callbacks only fire on the thread whose GLib.MainContext
+    is being iterated. That's the main thread (where GTK runs). So we must
+    do subscribe + call + callback all there.
+
+    Returns False (GLib.idle_add convention: don't repeat).
     """
     global _portal_token_counter
     _portal_token_counter += 1
 
     bus = _get_session_bus()
-    result_event = threading.Event()
-    captured: dict[str, str | None] = {"uri": None}
 
-    # Build a predictable request path so we can subscribe before calling
     sender = bus.get_unique_name().lstrip(":").replace(".", "_")
     handle_token = f"detector_v0_{_portal_token_counter}"
     request_path = f"/org/freedesktop/portal/desktop/request/{sender}/{handle_token}"
@@ -135,10 +136,25 @@ def _screenshot_portal(tmp_path: str) -> bool:
     def on_response(_conn, _sender, _path, _iface, _signal, params):
         response, results = params.unpack()
         if response == 0:
-            captured["uri"] = results["uri"]
+            uri = results["uri"]
+            src = unquote(urlparse(uri).path)
+            try:
+                with open(src, "rb") as fsrc, open(tmp_path, "wb") as fdst:
+                    fdst.write(fsrc.read())
+                captured["ok"] = True
+            except Exception as e:
+                log.error("Failed to read portal screenshot: %s", e)
+            finally:
+                try:
+                    os.unlink(src)
+                except OSError:
+                    pass
+        else:
+            log.warning("Portal screenshot response code: %s", response)
+        bus.signal_unsubscribe(sub_id)
         result_event.set()
 
-    # Subscribe FIRST — before making the portal call
+    # Subscribe FIRST
     sub_id = bus.signal_subscribe(
         "org.freedesktop.portal.Desktop",
         "org.freedesktop.portal.Request",
@@ -167,31 +183,16 @@ def _screenshot_portal(tmp_path: str) -> bool:
     except Exception as e:
         bus.signal_unsubscribe(sub_id)
         log.error("Portal Screenshot call failed: %s", e)
-        return False
+        result_event.set()
 
-    result_event.wait(timeout=10.0)
-    bus.signal_unsubscribe(sub_id)
-
-    if captured["uri"] is None:
-        return False
-
-    # Portal saves its own file; copy to our tmp_path
-    src = unquote(urlparse(captured["uri"]).path)
-    try:
-        with open(src, "rb") as fsrc, open(tmp_path, "wb") as fdst:
-            fdst.write(fsrc.read())
-    finally:
-        try:
-            os.unlink(src)
-        except OSError:
-            pass
-    return True
+    return False  # GLib.idle_add: run once
 
 
 async def capture_screenshot() -> bytes:
     """Capture a full-screen PNG screenshot (silent, no flash).
 
-    Tries GNOME Shell D-Bus first, falls back to XDG portal.
+    Tries GNOME Shell D-Bus first, falls back to XDG portal (run on
+    main GTK thread so D-Bus signals are dispatched correctly).
     Returns PNG bytes.
     """
     fd, tmp_path = tempfile.mkstemp(suffix=".png")
@@ -201,7 +202,21 @@ async def capture_screenshot() -> bytes:
         ok = await loop.run_in_executor(None, _screenshot_gnome_shell, tmp_path)
         if not ok:
             log.info("GNOME Shell screenshot denied, trying portal fallback")
-            ok = await loop.run_in_executor(None, _screenshot_portal, tmp_path)
+            result_event = threading.Event()
+            captured: dict = {"ok": False}
+
+            # Schedule on the GTK main thread
+            GLib.idle_add(
+                _screenshot_portal_on_main_thread,
+                tmp_path, result_event, captured,
+            )
+
+            # Wait (non-blocking to the event loop)
+            got_it = await loop.run_in_executor(
+                None, lambda: result_event.wait(timeout=10.0)
+            )
+            ok = got_it and captured.get("ok", False)
+
         if not ok:
             raise RuntimeError("All screenshot methods failed")
         with open(tmp_path, "rb") as f:
