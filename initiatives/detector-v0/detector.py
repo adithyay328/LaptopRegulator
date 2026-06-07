@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Detector V0 — distraction detector for Linux desktops.
 
-Periodically captures a screenshot (via XDG Desktop Portal) and audio
+Periodically captures a screenshot (via /dev/fb0 framebuffer) and audio
 (via pw-record), sends both to Gemini 3.1 Flash-Lite for analysis, and
 shows a system tray cross icon: green = productive, red = distracting.
 
@@ -12,9 +12,10 @@ System dependencies:
     pw-record                          PipeWire audio recorder
     python3-gi                         PyGObject
     gir1.2-ayatanaappindicator3-0.1    Tray indicator
+    User must be in the 'video' group   (sudo usermod -aG video $USER)
 
 Python dependencies:
-    pip install 'pydantic-ai[google]'
+    pip install 'pydantic-ai[google]' Pillow
 
 Secrets:
     ~/.agents/secrets/google_ai_studio   Google AI Studio API key
@@ -23,24 +24,21 @@ Secrets:
 from __future__ import annotations
 
 import asyncio
+import io
 import logging
+import mmap
 import os
 import signal
+import struct
 import tempfile
 import threading
 from dataclasses import dataclass, field
 from pathlib import Path
-from urllib.parse import unquote, urlparse
 
-import dbus
-import dbus.mainloop.glib  # noqa: E402
 import gi
 
 gi.require_version("Gtk", "3.0")
 gi.require_version("AyatanaAppIndicator3", "0.1")
-
-# Wire dbus-python into the GLib main loop BEFORE any bus connections
-dbus.mainloop.glib.DBusGMainLoop(set_as_default=True)
 
 from gi.repository import AyatanaAppIndicator3, GLib, Gtk  # noqa: E402
 from pydantic_ai import Agent, BinaryContent, RunContext  # noqa: E402
@@ -81,94 +79,70 @@ Ambiguous content should NOT be flagged.
 """
 
 # ---------------------------------------------------------------------------
-# Screen capture (XDG Desktop Portal via dbus-python)
+# Screen capture (direct /dev/fb0 framebuffer read — no portal, no flash)
 # ---------------------------------------------------------------------------
 
-_dbus_session: dbus.SessionBus | None = None
+FB_DEVICE = "/dev/fb0"
 
 
-def _get_dbus_session() -> dbus.SessionBus:
-    global _dbus_session
-    if _dbus_session is None:
-        _dbus_session = dbus.SessionBus()
-    return _dbus_session
+def _read_fb_info() -> tuple[int, int, int]:
+    """Read framebuffer dimensions from sysfs. Returns (width, height, bpp)."""
+    base = Path("/sys/class/graphics/fb0")
+    vsize = (base / "virtual_size").read_text().strip()
+    w, h = (int(x) for x in vsize.split(","))
+    bpp = int((base / "bits_per_pixel").read_text().strip())
+    return w, h, bpp
 
 
-def _take_screenshot_sync() -> str:
-    """Take a screenshot via the XDG Desktop Portal.
+def _fb_to_png(width: int, height: int, raw: bytes) -> bytes:
+    """Convert raw BGRA/BGRX framebuffer data to PNG bytes.
 
-    Uses dbus-python + GLib main loop integration (proven pattern from
-    Stack Overflow / xdg-desktop-portal docs).
-
-    Returns the file path of the saved screenshot.
-    Blocks until the portal responds (up to 15s).
+    Uses the pure-Python approach: write a minimal PNG via zlib.
+    The framebuffer is BGRX (32bpp) — we swap to RGB for the PNG.
     """
-    bus = _get_dbus_session()
-    result_event = threading.Event()
-    result_data: dict[str, str | None] = {"path": None}
+    from PIL import Image
 
-    # Predict the request object path so we can subscribe before calling
-    sender = bus.get_connection().get_unique_name()[1:].replace(".", "_")
-    token = f"detector_{threading.get_ident()}"
-    request_path = f"/org/freedesktop/portal/desktop/request/{sender}/{token}"
+    # Framebuffer is BGRX 32bpp — 4 bytes per pixel, but blue/red swapped
+    img = Image.frombytes("RGBA", (width, height), raw, "raw", "BGRA")
+    img = img.convert("RGB")
 
-    def on_response(response, results):
-        if response == 0 and "uri" in results:
-            uri = str(results["uri"])
-            result_data["path"] = unquote(urlparse(uri).path)
-        result_event.set()
+    buf = io.BytesIO()
+    img.save(buf, format="PNG", optimize=False)
+    return buf.getvalue()
 
-    # Subscribe to the Response signal BEFORE making the call
-    bus.add_signal_receiver(
-        on_response,
-        signal_name="Response",
-        dbus_interface="org.freedesktop.portal.Request",
-        path=request_path,
-    )
 
-    # Make the portal call
-    portal = bus.get_object(
-        "org.freedesktop.portal.Desktop",
-        "/org/freedesktop/portal/desktop",
-    )
-    portal.Screenshot(
-        "",  # parent_window
-        {
-            "handle_token": token,
-            "interactive": dbus.Boolean(False),
-        },
-        dbus_interface="org.freedesktop.portal.Screenshot",
-    )
+def _take_screenshot_sync() -> bytes:
+    """Read the screen directly from /dev/fb0. No D-Bus, no portal, no flash.
 
-    # Wait for the response signal (dispatched by GLib main loop on main thread)
-    result_event.wait(timeout=15.0)
+    Requires the user to be in the 'video' group (or root).
+    Returns PNG bytes.
+    """
+    w, h, bpp = _read_fb_info()
+    stride = w * (bpp // 8)
+    size = stride * h
 
-    if result_data["path"] is None:
-        raise RuntimeError("Portal screenshot failed or timed out")
+    fd = os.open(FB_DEVICE, os.O_RDONLY)
+    try:
+        buf = mmap.mmap(fd, size, mmap.MAP_SHARED, mmap.PROT_READ)
+        try:
+            raw = buf[:size]
+        finally:
+            buf.close()
+    finally:
+        os.close(fd)
 
-    return result_data["path"]
+    return _fb_to_png(w, h, raw)
 
 
 async def capture_screenshot() -> bytes:
-    """Capture a full-screen PNG screenshot via XDG Desktop Portal.
+    """Capture the screen by reading /dev/fb0 directly.
 
-    Returns PNG bytes. Note: on GNOME this may briefly flash the screen;
-    this is a GNOME design choice with no workaround via the portal API.
+    Completely silent — reads the GPU scanout buffer via the Linux
+    framebuffer device. No compositor interaction, no flash, no animation.
+    Requires membership in the 'video' group.
     """
     loop = asyncio.get_running_loop()
-    src_path = await loop.run_in_executor(None, _take_screenshot_sync)
-
-    try:
-        with open(src_path, "rb") as f:
-            data = f.read()
-    finally:
-        try:
-            os.unlink(src_path)
-        except OSError:
-            pass
-
-    if len(data) < 100:
-        raise RuntimeError(f"Screenshot too small ({len(data)} bytes)")
+    data = await loop.run_in_executor(None, _take_screenshot_sync)
     log.info("Captured screenshot: %d bytes", len(data))
     return data
 
