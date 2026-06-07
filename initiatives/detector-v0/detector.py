@@ -367,8 +367,6 @@ def main() -> None:
     def run_async_loop():
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
-        for sig in (signal.SIGINT, signal.SIGTERM):
-            loop.add_signal_handler(sig, request_stop)
         try:
             loop.run_until_complete(run_loop(tray, stop_event))
         finally:
