@@ -446,7 +446,15 @@ def main() -> None:
         log.info("Stop requested")
         stop_event.set()
 
-    tray.on_quit(request_stop)
+    def shutdown():
+        request_stop()
+        tray.quit()
+
+    tray.on_quit(shutdown)
+
+    # Let Ctrl+C trigger a clean shutdown through the GLib main loop
+    GLib.unix_signal_add(GLib.PRIORITY_HIGH, signal.SIGINT, shutdown)
+    GLib.unix_signal_add(GLib.PRIORITY_HIGH, signal.SIGTERM, shutdown)
 
     def run_async_loop():
         loop = asyncio.new_event_loop()
@@ -455,15 +463,11 @@ def main() -> None:
             loop.run_until_complete(run_loop(tray, stop_event))
         finally:
             loop.close()
-        tray.quit()
 
     thread = threading.Thread(target=run_async_loop, daemon=True)
     thread.start()
 
-    try:
-        tray.run()
-    except KeyboardInterrupt:
-        request_stop()
+    tray.run()  # blocks until GTK quits
 
     thread.join(timeout=10)
     log.info("Detector V0 stopped")
