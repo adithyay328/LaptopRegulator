@@ -111,24 +111,26 @@ def _screenshot_gnome_shell(tmp_path: str) -> bool:
         return False
 
 
+_portal_token_counter = 0
+
+
 def _screenshot_portal(tmp_path: str) -> bool:
-    """Fallback: XDG Desktop Portal Screenshot (interactive=false)."""
+    """Fallback: XDG Desktop Portal Screenshot (interactive=false).
+
+    Subscribes to the Response signal BEFORE making the call so we never
+    miss a fast reply.
+    """
+    global _portal_token_counter
+    _portal_token_counter += 1
+
     bus = _get_session_bus()
     result_event = threading.Event()
     captured: dict[str, str | None] = {"uri": None}
 
-    reply = bus.call_sync(
-        "org.freedesktop.portal.Desktop",
-        "/org/freedesktop/portal/desktop",
-        "org.freedesktop.portal.Screenshot",
-        "Screenshot",
-        GLib.Variant("(sa{sv})", ("", {"interactive": GLib.Variant("b", False)})),
-        GLib.VariantType("(o)"),
-        Gio.DBusCallFlags.NONE,
-        10000,
-        None,
-    )
-    request_path = reply.unpack()[0]
+    # Build a predictable request path so we can subscribe before calling
+    sender = bus.get_unique_name().lstrip(":").replace(".", "_")
+    handle_token = f"detector_v0_{_portal_token_counter}"
+    request_path = f"/org/freedesktop/portal/desktop/request/{sender}/{handle_token}"
 
     def on_response(_conn, _sender, _path, _iface, _signal, params):
         response, results = params.unpack()
@@ -136,15 +138,36 @@ def _screenshot_portal(tmp_path: str) -> bool:
             captured["uri"] = results["uri"]
         result_event.set()
 
+    # Subscribe FIRST — before making the portal call
     sub_id = bus.signal_subscribe(
         "org.freedesktop.portal.Desktop",
         "org.freedesktop.portal.Request",
         "Response",
         request_path,
         None,
-        Gio.DBusSignalFlags.NO_MATCH_RULE,
+        Gio.DBusSignalFlags.NONE,
         on_response,
     )
+
+    try:
+        bus.call_sync(
+            "org.freedesktop.portal.Desktop",
+            "/org/freedesktop/portal/desktop",
+            "org.freedesktop.portal.Screenshot",
+            "Screenshot",
+            GLib.Variant("(sa{sv})", ("", {
+                "interactive": GLib.Variant("b", False),
+                "handle_token": GLib.Variant("s", handle_token),
+            })),
+            GLib.VariantType("(o)"),
+            Gio.DBusCallFlags.NONE,
+            10000,
+            None,
+        )
+    except Exception as e:
+        bus.signal_unsubscribe(sub_id)
+        log.error("Portal Screenshot call failed: %s", e)
+        return False
 
     result_event.wait(timeout=10.0)
     bus.signal_unsubscribe(sub_id)
