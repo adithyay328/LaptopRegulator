@@ -1,0 +1,3 @@
+.issuescache.sqlite
+__pycache__/
+worktrees/

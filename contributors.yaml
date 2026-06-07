@@ -1,0 +1,23 @@
+- name: Alice Smith
+  nicknames:
+    - alice
+    - als
+  email: alice.smith@example.com
+
+- name: Bob Chen
+  nicknames:
+    - bob
+    - bc
+  email: bob.chen@example.com
+
+- name: Carol Jones
+  nicknames:
+    - carol
+    - cj
+  email: carol.jones@example.com
+
+- name: Adithya Yerramsetty
+  nicknames:
+    - adithya
+    - adi
+  email: adithya.yerramsetty@gmail.com
