@@ -32,22 +32,17 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from urllib.parse import unquote, urlparse
 
+import dbus
+import dbus.mainloop.glib  # noqa: E402
 import gi
 
 gi.require_version("Gtk", "3.0")
 gi.require_version("AyatanaAppIndicator3", "0.1")
 
-from gi.repository import AyatanaAppIndicator3, Gio, GLib, Gtk  # noqa: E402
+# Wire dbus-python into the GLib main loop BEFORE any bus connections
+dbus.mainloop.glib.DBusGMainLoop(set_as_default=True)
 
-_session_bus: Gio.DBusConnection | None = None
-
-
-def _get_session_bus() -> Gio.DBusConnection:
-    """Lazy singleton for the session D-Bus connection."""
-    global _session_bus
-    if _session_bus is None:
-        _session_bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
-    return _session_bus
+from gi.repository import AyatanaAppIndicator3, GLib, Gtk  # noqa: E402
 from pydantic_ai import Agent, BinaryContent, RunContext  # noqa: E402
 
 log = logging.getLogger(__name__)
@@ -86,150 +81,96 @@ Ambiguous content should NOT be flagged.
 """
 
 # ---------------------------------------------------------------------------
-# Screen capture (GNOME Wayland — silent, no flash)
+# Screen capture (XDG Desktop Portal via dbus-python)
 # ---------------------------------------------------------------------------
 
-
-def _screenshot_gnome_shell(tmp_path: str) -> bool:
-    """Try org.gnome.Shell.Screenshot (no flash, no UI). Returns True on success."""
-    try:
-        result = _get_session_bus().call_sync(
-            "org.gnome.Shell.Screenshot",
-            "/org/gnome/Shell/Screenshot",
-            "org.gnome.Shell.Screenshot",
-            "Screenshot",
-            GLib.Variant("(bbs)", (False, False, tmp_path)),
-            GLib.VariantType("(bs)"),
-            Gio.DBusCallFlags.NONE,
-            10000,
-            None,
-        )
-        success, _path = result.unpack()
-        return success
-    except Exception as e:
-        log.debug("GNOME Shell screenshot unavailable: %s", e)
-        return False
+_dbus_session: dbus.SessionBus | None = None
 
 
-_portal_token_counter = 0
+def _get_dbus_session() -> dbus.SessionBus:
+    global _dbus_session
+    if _dbus_session is None:
+        _dbus_session = dbus.SessionBus()
+    return _dbus_session
 
 
-def _screenshot_portal_on_main_thread(tmp_path: str, result_event: threading.Event,
-                                       captured: dict) -> bool:
-    """Schedule the portal screenshot entirely on the GLib main thread.
+def _take_screenshot_sync() -> str:
+    """Take a screenshot via the XDG Desktop Portal.
 
-    D-Bus signal callbacks only fire on the thread whose GLib.MainContext
-    is being iterated. That's the main thread (where GTK runs). So we must
-    do subscribe + call + callback all there.
+    Uses dbus-python + GLib main loop integration (proven pattern from
+    Stack Overflow / xdg-desktop-portal docs).
 
-    Returns False (GLib.idle_add convention: don't repeat).
+    Returns the file path of the saved screenshot.
+    Blocks until the portal responds (up to 15s).
     """
-    global _portal_token_counter
-    _portal_token_counter += 1
+    bus = _get_dbus_session()
+    result_event = threading.Event()
+    result_data: dict[str, str | None] = {"path": None}
 
-    bus = _get_session_bus()
+    # Predict the request object path so we can subscribe before calling
+    sender = bus.get_connection().get_unique_name()[1:].replace(".", "_")
+    token = f"detector_{threading.get_ident()}"
+    request_path = f"/org/freedesktop/portal/desktop/request/{sender}/{token}"
 
-    sender = bus.get_unique_name().lstrip(":").replace(".", "_")
-    handle_token = f"detector_v0_{_portal_token_counter}"
-    request_path = f"/org/freedesktop/portal/desktop/request/{sender}/{handle_token}"
-
-    def on_response(_conn, _sender, _path, _iface, _signal, params):
-        response, results = params.unpack()
-        if response == 0:
-            uri = results["uri"]
-            src = unquote(urlparse(uri).path)
-            try:
-                with open(src, "rb") as fsrc, open(tmp_path, "wb") as fdst:
-                    fdst.write(fsrc.read())
-                captured["ok"] = True
-            except Exception as e:
-                log.error("Failed to read portal screenshot: %s", e)
-            finally:
-                try:
-                    os.unlink(src)
-                except OSError:
-                    pass
-        else:
-            log.warning("Portal screenshot response code: %s", response)
-        bus.signal_unsubscribe(sub_id)
+    def on_response(response, results):
+        if response == 0 and "uri" in results:
+            uri = str(results["uri"])
+            result_data["path"] = unquote(urlparse(uri).path)
         result_event.set()
 
-    # Subscribe FIRST
-    sub_id = bus.signal_subscribe(
-        "org.freedesktop.portal.Desktop",
-        "org.freedesktop.portal.Request",
-        "Response",
-        request_path,
-        None,
-        Gio.DBusSignalFlags.NONE,
+    # Subscribe to the Response signal BEFORE making the call
+    bus.add_signal_receiver(
         on_response,
+        signal_name="Response",
+        dbus_interface="org.freedesktop.portal.Request",
+        path=request_path,
     )
 
-    try:
-        bus.call_sync(
-            "org.freedesktop.portal.Desktop",
-            "/org/freedesktop/portal/desktop",
-            "org.freedesktop.portal.Screenshot",
-            "Screenshot",
-            GLib.Variant("(sa{sv})", ("", {
-                "interactive": GLib.Variant("b", False),
-                "handle_token": GLib.Variant("s", handle_token),
-            })),
-            GLib.VariantType("(o)"),
-            Gio.DBusCallFlags.NONE,
-            10000,
-            None,
-        )
-    except Exception as e:
-        bus.signal_unsubscribe(sub_id)
-        log.error("Portal Screenshot call failed: %s", e)
-        result_event.set()
+    # Make the portal call
+    portal = bus.get_object(
+        "org.freedesktop.portal.Desktop",
+        "/org/freedesktop/portal/desktop",
+    )
+    portal.Screenshot(
+        "",  # parent_window
+        {
+            "handle_token": token,
+            "interactive": dbus.Boolean(False),
+        },
+        dbus_interface="org.freedesktop.portal.Screenshot",
+    )
 
-    return False  # GLib.idle_add: run once
+    # Wait for the response signal (dispatched by GLib main loop on main thread)
+    result_event.wait(timeout=15.0)
+
+    if result_data["path"] is None:
+        raise RuntimeError("Portal screenshot failed or timed out")
+
+    return result_data["path"]
 
 
 async def capture_screenshot() -> bytes:
-    """Capture a full-screen PNG screenshot (silent, no flash).
+    """Capture a full-screen PNG screenshot via XDG Desktop Portal.
 
-    Tries GNOME Shell D-Bus first, falls back to XDG portal (run on
-    main GTK thread so D-Bus signals are dispatched correctly).
-    Returns PNG bytes.
+    Returns PNG bytes. Note: on GNOME this may briefly flash the screen;
+    this is a GNOME design choice with no workaround via the portal API.
     """
-    fd, tmp_path = tempfile.mkstemp(suffix=".png")
-    os.close(fd)
+    loop = asyncio.get_running_loop()
+    src_path = await loop.run_in_executor(None, _take_screenshot_sync)
+
     try:
-        loop = asyncio.get_running_loop()
-        ok = await loop.run_in_executor(None, _screenshot_gnome_shell, tmp_path)
-        if not ok:
-            log.info("GNOME Shell screenshot denied, trying portal fallback")
-            result_event = threading.Event()
-            captured: dict = {"ok": False}
-
-            # Schedule on the GTK main thread
-            GLib.idle_add(
-                _screenshot_portal_on_main_thread,
-                tmp_path, result_event, captured,
-            )
-
-            # Wait (non-blocking to the event loop)
-            got_it = await loop.run_in_executor(
-                None, lambda: result_event.wait(timeout=10.0)
-            )
-            ok = got_it and captured.get("ok", False)
-
-        if not ok:
-            raise RuntimeError("All screenshot methods failed")
-        with open(tmp_path, "rb") as f:
+        with open(src_path, "rb") as f:
             data = f.read()
-        if len(data) < 100:
-            raise RuntimeError(f"Screenshot too small ({len(data)} bytes)")
-        log.info("Captured screenshot: %d bytes", len(data))
-        return data
     finally:
         try:
-            os.unlink(tmp_path)
+            os.unlink(src_path)
         except OSError:
             pass
+
+    if len(data) < 100:
+        raise RuntimeError(f"Screenshot too small ({len(data)} bytes)")
+    log.info("Captured screenshot: %d bytes", len(data))
+    return data
 
 
 # ---------------------------------------------------------------------------
