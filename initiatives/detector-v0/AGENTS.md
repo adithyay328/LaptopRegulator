@@ -18,22 +18,18 @@ shows a system tray indicator (cross shape: green = OK, red = distracting).
 ```
 initiatives/detector-v0/
   AGENTS.md              # This file
-  pyproject.toml         # Package definition and dependencies
-  src/
-    detector_v0/
-      __init__.py
-      screen_capture.py  # Wayland screenshot via grim
-      audio_capture.py   # Audio recording via pw-record
-      analyzer.py        # Pydantic AI agent with Gemini
-      tray_icon.py       # System tray cross indicator
-      main.py            # Orchestrator / entry point
+  detector.py            # Standalone script — all code in one file
+  icons/
+    green.svg            # Tray icon: productive
+    red.svg              # Tray icon: distracting
   issues/                # Sub-issues for this initiative
 ```
 
 ## Conventions
 
-- All code in `src/detector_v0/`.
-- Entry point: `python -m detector_v0` (or `python src/detector_v0/main.py`).
+- All code in `detector.py`.
+- Entry point: `python detector.py`.
+- No package install needed — just `pip install 'pydantic-ai[google]'` for the dependency.
 - Audio: same approach as `../dictate` — subprocess `pw-record` to temp WAV.
 - Screenshots: subprocess `grim` writing to temp PNG.
 - Analysis loop: capture screenshot + N seconds of audio, send to Gemini, update tray.
